@@ -12,20 +12,22 @@ import pandas as pd
 np.random.seed(42)
 
 # Configuration
+START_TIME = datetime(2023, 1, 1, 0, 0, 0)
 NUM_ENTRIES_PER_LIFT = 20_000
 HOURS_PER_STEP = 12
-FNAME = "predictive_maintenance_lifts.csv"
+OUTPUT_FILENAME = "predictive_maintenance_lifts"
 MAX_STEPS_BEF_MAINTENANCE = 180  # 180 steps * 12 hours = 90 days (3 months)
 
 # Define 3 lift models with different starting ages
-lifts = [
-    {"id": "LIFT_001", "model": "Otis Gen2", "age_start": 15000},
-    {"id": "LIFT_002", "model": "Schindler 3300", "age_start": 32000},
-    {"id": "LIFT_003", "model": "KONE MonoSpace", "age_start": 8500},
+LIFTS = [
+    # NOTE the `id` field must be determined during actual preprocessing
+    {"id": 1, "model": "Otis Gen2", "age_start": 15000},
+    {"id": 2, "model": "Schindler 3300", "age_start": 32000},
+    {"id": 3, "model": "KONE MonoSpace", "age_start": 8500},
 ]
 
 # "Healthy" starting metrics
-baselines = {
+BASELINES = {
     "ARM_DIST": 0.5,  # mm
     "DOOR_DIST": 2.0,  # mm
     "FLOOR_DIST": 0.0,  # mm (perfectly flush)
@@ -34,7 +36,7 @@ baselines = {
 }
 
 # "Breakdown" metrics
-criticals = {
+CRITICALS = {
     "ARM_DIST": 1.5,
     "DOOR_DIST": 8.0,
     "FLOOR_DIST": 15.0,
@@ -42,87 +44,152 @@ criticals = {
     "BEARING_TEMP": 80.0,
 }
 
-# Base degradation rates per 12-hour step (scaled to hit critical around 100-150 steps)
-base_rates = {
-    "ARM_DIST": (criticals["ARM_DIST"] - baselines["ARM_DIST"]) / 140,
-    "DOOR_DIST": (criticals["DOOR_DIST"] - baselines["DOOR_DIST"]) / 100,
-    "FLOOR_DIST": (criticals["FLOOR_DIST"] - baselines["FLOOR_DIST"]) / 150,
-    "ROPE_MFL": (criticals["ROPE_MFL"] - baselines["ROPE_MFL"])
-    / 500,  # Rope degrades slower naturally
-    "BEARING_TEMP": (criticals["BEARING_TEMP"] - baselines["BEARING_TEMP"]) / 120,
+# Base degradation rates per 12-hour step (scaled to hit critical around 200--300 steps)
+BASE_RATES = {
+    "ARM_DIST": (CRITICALS["ARM_DIST"] - BASELINES["ARM_DIST"]) / 280,
+    "DOOR_DIST": (CRITICALS["DOOR_DIST"] - BASELINES["DOOR_DIST"]) / 200,
+    "FLOOR_DIST": (CRITICALS["FLOOR_DIST"] - BASELINES["FLOOR_DIST"]) / 300,
+    # Ropes naturally degrade slower
+    "ROPE_MFL": (CRITICALS["ROPE_MFL"] - BASELINES["ROPE_MFL"]) / 1000,
+    "BEARING_TEMP": (CRITICALS["BEARING_TEMP"] - BASELINES["BEARING_TEMP"]) / 240,
 }
 
-rows = []
-start_time = datetime(2023, 1, 1, 0, 0, 0)
 
-for lift in lifts:
-    age = lift["age_start"]
-    curr_time = start_time
-    time_since_maintenance = 0
+def compute_rul(record: pd.Series, avail_maintenances: pd.DataFrame) -> float:
+    """
+    Compute the remaining useful life (RUL) in h for a given record.
+    NOTE If real-world data is used, this method must be done during preprocessing.
+    """
+    time_now = record["timestamp"]
+    # Get the next available maintenance (should be greater than the current time)
+    next_available_maintenance = avail_maintenances[
+        avail_maintenances["timestamp"] >= time_now
+    ]["timestamp"].min()
+    # If no further maintenance exists, then RUL is np.inf
+    if pd.isna(next_available_maintenance):
+        return np.inf  # np.infs will be filtered out during training
+    # If there exists a further maintenance, compute the RUL in hours
+    time_now = pd.to_datetime(time_now).to_pydatetime()
+    next_available_maintenance = pd.to_datetime(
+        next_available_maintenance
+    ).to_pydatetime()
+    return (next_available_maintenance - time_now).total_seconds() / 3600
 
-    # Pure base values (without sensor noise)
-    current_base = baselines.copy()
 
-    # Randomise degradation rates for the current maintenance cycle (simulates independent root-causes)
-    cycle_rates = {k: v * np.random.uniform(0.5, 2.5) for k, v in base_rates.items()}
+class LiftDataGenerator:
+    """
+    Manages state and generates data entries for a single lift.
+    """
 
-    for _ in range(NUM_ENTRIES_PER_LIFT):
-        # Calculate realistic sensor readings (base + degradation rate + noise)
-        row_sensors = {
-            "ARM_DIST": current_base["ARM_DIST"] + np.random.normal(0, 0.02),
-            "DOOR_DIST": current_base["DOOR_DIST"] + np.random.normal(0, 0.1),
-            "FLOOR_DIST": current_base["FLOOR_DIST"] + np.random.normal(0, 0.2),
-            "ROPE_MFL": current_base["ROPE_MFL"] + np.random.normal(0, 0.5),
-            "BEARING_TEMP": current_base["BEARING_TEMP"] + np.random.normal(0, 1.0),
+    def __init__(self, lift: dict, start_time: datetime):
+        self.lift = lift
+        self.age = lift["age_start"]
+        self.cur_time = start_time
+        self.time_since_maintenance = 0
+        self.baselines = BASELINES.copy()
+        # Randomise degradation rates for the current maintenance cycle
+        self.cycle_rates = {
+            k: v * np.random.uniform(0.5, 2.5) for k, v in BASE_RATES.items()
         }
 
-        # Ensure minimum absolute physics rules apply (e.g. distance from flush is absolute)
-        row_sensors["ARM_DIST"] = max(0.1, row_sensors["ARM_DIST"])
-        row_sensors["DOOR_DIST"] = max(0.1, row_sensors["DOOR_DIST"])
-        row_sensors["FLOOR_DIST"] = abs(row_sensors["FLOOR_DIST"])
-        row_sensors["ROPE_MFL"] = max(1.0, row_sensors["ROPE_MFL"])
-        row_sensors["BEARING_TEMP"] = max(20.0, row_sensors["BEARING_TEMP"])
+    def generate_entry(self) -> dict:
+        """Generate a single entry and update internal state."""
+        # Calculate realistic sensor readings (base + degradation rate + noise)
+        sensor_rows = {
+            "ARM_DIST": self.baselines["ARM_DIST"] + np.random.normal(0, 0.02),
+            "DOOR_DIST": self.baselines["DOOR_DIST"] + np.random.normal(0, 0.1),
+            "FLOOR_DIST": self.baselines["FLOOR_DIST"] + np.random.normal(0, 0.2),
+            "ROPE_MFL": self.baselines["ROPE_MFL"] + np.random.normal(0, 0.5),
+            "BEARING_TEMP": self.baselines["BEARING_TEMP"] + np.random.normal(0, 1.0),
+        }
+
+        # Ensure minimum absolute physics rules apply
+        sensor_rows["ARM_DIST"] = max(0.1, sensor_rows["ARM_DIST"])
+        sensor_rows["DOOR_DIST"] = max(0.1, sensor_rows["DOOR_DIST"])
+        sensor_rows["FLOOR_DIST"] = abs(sensor_rows["FLOOR_DIST"])
+        sensor_rows["ROPE_MFL"] = max(1.0, sensor_rows["ROPE_MFL"])
+        sensor_rows["BEARING_TEMP"] = max(20.0, sensor_rows["BEARING_TEMP"])
 
         # Check whether the lift is due for maintenance
-        breakdown_triggered = any(row_sensors[k] >= v for k, v in criticals.items())
-        scheduled_maintenance = time_since_maintenance >= MAX_STEPS_BEF_MAINTENANCE
+        breakdown_triggered = any(sensor_rows[k] >= v for k, v in CRITICALS.items())
+        scheduled_maintenance = self.time_since_maintenance >= MAX_STEPS_BEF_MAINTENANCE
         maintenance_done = int(breakdown_triggered or scheduled_maintenance)
 
-        # Write row to dataset
-        rows.append(
-            {
-                "timestamp": curr_time.strftime("%Y-%m-%d %H:%M:%S"),
-                "lift_id": lift["id"],
-                "lift_model": lift["model"],
-                "lift_age_hours": age,
-                "ARM_DIST_mm": round(row_sensors["ARM_DIST"], 3),
-                "DOOR_DIST_mm": round(row_sensors["DOOR_DIST"], 3),
-                "FLOOR_DIST_mm": round(row_sensors["FLOOR_DIST"], 3),
-                "ROPE_MFL_mV": round(row_sensors["ROPE_MFL"], 3),
-                "BEARING_TEMP_C": round(row_sensors["BEARING_TEMP"], 3),
-                "maintenance_done": maintenance_done,
-            }
-        )
+        # Create row entry
+        row = {
+            "timestamp": self.cur_time.strftime("%Y-%m-%d %H:%M:%S"),
+            "lift_id": self.lift["id"],
+            "lift_model": self.lift["model"],
+            "lift_age_hours": self.age,
+            "ARM_DIST_mm": round(sensor_rows["ARM_DIST"], 3),
+            "DOOR_DIST_mm": round(sensor_rows["DOOR_DIST"], 3),
+            "FLOOR_DIST_mm": round(sensor_rows["FLOOR_DIST"], 3),
+            "ROPE_MFL_mV": round(sensor_rows["ROPE_MFL"], 3),
+            "BEARING_TEMP_C": round(sensor_rows["BEARING_TEMP"], 3),
+            "maintenance_done": maintenance_done,
+        }
 
-        # Update states for the next step (12 hours later)
+        # Update states for the next step
         if maintenance_done:
-            # Reset values to healthy baselines
-            current_base = baselines.copy()
-            # Reroll degradation rates so the next cycle fails differently
-            cycle_rates = {
-                k: v * np.random.uniform(0.5, 2.5) for k, v in base_rates.items()
+            self.baselines = BASELINES.copy()
+            self.cycle_rates = {
+                k: v * np.random.uniform(0.5, 2.5) for k, v in BASE_RATES.items()
             }
-            time_since_maintenance = 0
+            self.time_since_maintenance = 0
         else:
-            # Degrade components further
-            for k in current_base:
-                current_base[k] += cycle_rates[k]
-            time_since_maintenance += 1
+            for k in self.baselines:
+                self.baselines[k] += self.cycle_rates[k]
+            self.time_since_maintenance += 1
 
-        # Increment time
-        age += HOURS_PER_STEP
-        curr_time += timedelta(hours=HOURS_PER_STEP)
+        # Increment time and age
+        self.age += HOURS_PER_STEP
+        self.cur_time += timedelta(hours=HOURS_PER_STEP)
 
-# Convert to pd.DataFrame
-df = pd.DataFrame(rows)
-df.to_csv(FNAME, index=False)
+        return row
+
+
+def generate_all_entries(
+    lift_models: list[dict] = LIFTS,
+    start_time: datetime = START_TIME,
+    n_entries_per_lift: int = NUM_ENTRIES_PER_LIFT,
+) -> pd.DataFrame:
+    """Generate all dataset entries for all lifts and return as a DataFrame."""
+    rows = []
+    for lift in lift_models:
+        generator = LiftDataGenerator(lift, start_time)
+        for _ in range(n_entries_per_lift):
+            rows.append(generator.generate_entry())
+    return pd.DataFrame(rows)
+
+
+def append_ruls(lift_df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Preprocess the dataset by computing RUL for each entry.
+    NOTE If real-world data is used, this method must be done during preprocessing.
+    """
+    lift_models = lift_df["lift_model"].unique()
+    lift_df = lift_df.copy()
+    maintenance_events = lift_df[lift_df["maintenance_done"] == 1]
+    for lift_model in lift_models:
+        # Get a list of all maintenance events for the current lift model
+        available_maintenance_events = maintenance_events[
+            maintenance_events["lift_model"] == lift_model
+        ]
+        # Get all log events for the current lift model
+        log_events = lift_df[lift_df["lift_model"] == lift_model]
+        # Then compute the RUL for each log event for each lift model
+        for idx, entry in log_events.iterrows():
+            rul = compute_rul(entry, available_maintenance_events)
+            lift_df.at[idx, "RUL_hrs"] = rul
+
+    return lift_df
+
+
+if __name__ == "__main__":
+    # Generate all dataset entries
+    df = generate_all_entries()
+    # Compute RULs
+    df = append_ruls(df)
+    # Export as CSV and as pickle
+    df.to_csv(OUTPUT_FILENAME + ".csv", index=False)
+    df.to_pickle(OUTPUT_FILENAME + ".pkl")
