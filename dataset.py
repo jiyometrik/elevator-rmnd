@@ -12,7 +12,7 @@ import pandas as pd
 np.random.seed(42)
 
 # Configuration
-NUM_ENTRIES_PER_LIFT = 2000
+NUM_ENTRIES_PER_LIFT = 20_000
 HOURS_PER_STEP = 12
 FNAME = "predictive_maintenance_lifts.csv"
 MAX_STEPS_BEF_MAINTENANCE = 180  # 180 steps * 12 hours = 90 days (3 months)

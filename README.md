@@ -2,7 +2,7 @@
 
 A collection of data analysis sandboxes for elevator RM&D systems
 
-As of 5/6/26,
-- `dataset.py` generates dummy data for model training purposes using random probability distributions
-- data is output into `lift_data.csv`; the `urgency` column requires manual labelling
-- `trial_v1.ipynb` contains trials on classical ML techniques
+As of 9/6/26,
+- `dataset.py` generates dummy data for model training purposes
+- data is output into `predictive_maintenance_lifts.csv`
+- `main.ipynb` contains a method to calculate the RUL, and further trials on classical ML techniques
