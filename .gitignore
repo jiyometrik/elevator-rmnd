@@ -2,6 +2,10 @@
 __pycache__/
 *.py[codz]
 *$py.class
+*.pkl*
+*.joblib*
+catboost_info/
+lightning_logs/
 
 # C extensions
 *.so
