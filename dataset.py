@@ -17,6 +17,8 @@ NUM_ENTRIES_PER_LIFT = 20_000
 HOURS_PER_STEP = 12
 OUTPUT_FILENAME = "predictive_maintenance_lifts"
 MAX_STEPS_BEF_MAINTENANCE = 180  # 180 steps * 12 hours = 90 days (3 months)
+GENERATE_CSV = False
+GENERATE_PKL = True
 
 # Define 3 lift models with different starting ages
 LIFTS = [
@@ -191,5 +193,7 @@ if __name__ == "__main__":
     # Compute RULs
     df = append_ruls(df)
     # Export as CSV and as pickle
-    df.to_csv(OUTPUT_FILENAME + ".csv", index=False)
-    df.to_pickle(OUTPUT_FILENAME + ".pkl")
+    if GENERATE_CSV:
+        df.to_csv(OUTPUT_FILENAME + ".csv", index=False)
+    if GENERATE_PKL:
+        df.to_pickle(OUTPUT_FILENAME + ".pkl")
