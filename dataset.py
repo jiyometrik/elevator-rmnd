@@ -166,8 +166,12 @@ def generate_all_entries(
 
 def preprocess(lift_df: pd.DataFrame) -> pd.DataFrame:
     """
-    Preprocess the dataset by computing RUL as well as time derivatives for each entry.
-    NOTE If real-world data is used, this method must be done during preprocessing.
+    Add to the existing feature set by:
+    * computing the relations between two features,
+    * computing the age since last maintenance (scaled to the expected maintenance cycle for each lift model),
+    * computing the time derivatives for each sensor metric, and
+    * computing the RUL for each entry.
+    NOTE If real-world data is used, all of the mechanisms here must be done during preprocessing.
     """
     lift_models = lift_df["lift_model"].unique()
     lift_df = lift_df.copy()
