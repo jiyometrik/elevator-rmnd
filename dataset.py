@@ -9,13 +9,13 @@ import numpy as np
 import pandas as pd
 
 # Set random seed for consistent generation
-np.random.seed(42)
+np.random.seed(79910)
 
 # Configuration
 START_TIME = datetime(2023, 1, 1, 0, 0, 0)
 NUM_ENTRIES_PER_LIFT = 20_000
 HOURS_PER_STEP = 12
-OUTPUT_FILENAME = "predictive_maintenance_lifts"
+OUTPUT_FILENAME = "liftdata_v3"
 MAX_STEPS_BEF_MAINTENANCE = 180  # 180 steps * 12 hours = 90 days (3 months)
 GENERATE_CSV = False
 GENERATE_PKL = True
@@ -164,13 +164,14 @@ def generate_all_entries(
     return pd.DataFrame(rows)
 
 
-def append_ruls(lift_df: pd.DataFrame) -> pd.DataFrame:
+def preprocess(lift_df: pd.DataFrame) -> pd.DataFrame:
     """
-    Preprocess the dataset by computing RUL for each entry.
+    Preprocess the dataset by computing RUL as well as time derivatives for each entry.
     NOTE If real-world data is used, this method must be done during preprocessing.
     """
     lift_models = lift_df["lift_model"].unique()
     lift_df = lift_df.copy()
+    # Add RULs
     maintenance_events = lift_df[lift_df["maintenance_done"] == 1]
     for lift_model in lift_models:
         # Get a list of all maintenance events for the current lift model
@@ -184,6 +185,44 @@ def append_ruls(lift_df: pd.DataFrame) -> pd.DataFrame:
             rul = compute_rul(entry, available_maintenance_events)
             lift_df.at[idx, "RUL_hrs"] = rul
 
+    # Add age since last maintenance, specific to each lift's maintenance cycle
+    lift_df["age_since_last_maint"] = lift_df.groupby("lift_id")[
+        "lift_age_hours"
+    ].transform(lambda x: x - x.where(lift_df["maintenance_done"] == 1).ffill())
+    expected_interval = lift_df.groupby("lift_model")["age_since_last_maint"].transform(
+        "median"
+    )
+    lift_df["age_since_last_maint"] = (
+        lift_df["age_since_last_maint"] / expected_interval
+    )
+
+    # Meta features
+    lift_df["arm_door_ratio"] = lift_df["ARM_DIST_mm"] / (
+        lift_df["DOOR_DIST_mm"] + 1e-6
+    )
+    lift_df["floor_door_ratio"] = lift_df["FLOOR_DIST_mm"] / (
+        lift_df["DOOR_DIST_mm"] + 1e-6
+    )
+    lift_df["temp_x_rope"] = lift_df["BEARING_TEMP_C"] * lift_df["ROPE_MFL_mV"]
+
+    # Cumulative features
+    lift_df["cumulative_rope_degradation"] = lift_df.groupby("lift_id")[
+        "ROPE_MFL_mV"
+    ].cumsum()
+    lift_df["cumulative_bearing_heat"] = lift_df.groupby("lift_id")[
+        "BEARING_TEMP_C"
+    ].cumsum()
+
+    # Time derivatives for each sensor metric
+    sensor_cols = [
+        "ARM_DIST_mm",
+        "DOOR_DIST_mm",
+        "FLOOR_DIST_mm",
+        "ROPE_MFL_mV",
+        "BEARING_TEMP_C",
+    ]
+    for col in sensor_cols:
+        lift_df[col + "_per_hr"] = np.round(lift_df[col].diff().fillna(0) / 12, 4)
     return lift_df
 
 
@@ -191,9 +230,11 @@ if __name__ == "__main__":
     # Generate all dataset entries
     df = generate_all_entries()
     # Compute RULs
-    df = append_ruls(df)
+    df = preprocess(df)
     # Export as CSV and as pickle
     if GENERATE_CSV:
         df.to_csv(OUTPUT_FILENAME + ".csv", index=False)
+        print(f"[OK] exported to csv - {OUTPUT_FILENAME}.csv")
     if GENERATE_PKL:
         df.to_pickle(OUTPUT_FILENAME + ".pkl")
+        print(f"[OK] exported to pickle - {OUTPUT_FILENAME}.pkl")
