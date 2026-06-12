@@ -102,9 +102,9 @@ _CASCADE_IDX: List[List[int]] = [
 class SimConfig:
     """Immutable simulation parameters.  Override via CLI or constructor."""
 
-    simulation_years: int = 5
+    simulation_years: int = 3
     start_time: datetime = datetime(2024, 1, 1)
-    seed: int = 42
+    seed: int = 4167
 
     # Random (non-wear) breakdown rate  (Poisson, independent of wear)
     baseline_breakdown_rate_per_year: float = 0.3
@@ -732,6 +732,19 @@ def preprocess(lift_df: pd.DataFrame) -> pd.DataFrame:
     * Cumulative features
     * Time derivatives for sensor metrics
     """
+    # Initialize maintenance_done as 0
+    lift_df["maintenance_done"] = 0
+
+    # Mark 1 when breakdown occurs
+    lift_df.loc[lift_df["breakdown_occurred"] == 1, "maintenance_done"] = 1
+
+    # Mark 1 when 3 months have passed since last maintenance
+    maintenance_threshold_hours = 3 * 30 * 24  # 3 months in hours (2160)
+    mask = (lift_df["hours_since_maintenance"] >= maintenance_threshold_hours) & (
+        lift_df["maintenance_done"] == 0
+    )
+    lift_df.loc[mask, "maintenance_done"] = 1
+
     lift_models = lift_df["lift_model"].unique()
     lift_df = lift_df.copy()
 
@@ -789,6 +802,8 @@ def preprocess(lift_df: pd.DataFrame) -> pd.DataFrame:
     for col in sensor_cols:
         lift_df[col + "_per_hr"] = np.round(lift_df[col].diff().fillna(0), 4)
 
+    # Create maintenance_done column: 1 when maintenance is needed (breakdown or 3 months passed)
+    # 3 months = 90 days = 2160 hours
     return lift_df
 
 
@@ -807,13 +822,30 @@ def main() -> None:
     # Apply preprocessing
     df = preprocess(df)
 
-    # Select and rename only the required columns
+    # Create timestamp column: 12 hours apart starting from config start_time
+    start_time = pd.to_datetime(cfg.start_time)
+    timestamps = [start_time + pd.Timedelta(hours=12 * i) for i in range(len(df))]
+
+    # Calculate LIFT_AGE_HR per lift (12 hours per entry)
+    lift_age_hr = []
+    for lift_id in df["lift_id"].unique():
+        lift_mask = df["lift_id"] == lift_id
+        n_entries = lift_mask.sum()
+        # Find initial age of this lift from fleet
+        initial_age = next(
+            (init_age for lid, _, init_age in fleet if lid == lift_id), 0
+        )
+        # Age increases by 12 hours per entry
+        lift_age_hr.extend([initial_age + 12 * (i + 1) for i in range(n_entries)])
+
+    # Create filtered DataFrame with timestamp and updated LIFT_AGE_HR
     df_filtered = pd.DataFrame(
         {
+            "TIMESTAMP": timestamps,
             "LIFT_ID": df["lift_id"],
             "LIFT_MODEL": df["lift_model"],
             "MODEL_ID": df["lift_model"].astype("category").cat.codes,
-            "LIFT_AGE_HR": df["lift_age_days"] * 24.0,
+            "LIFT_AGE_HR": lift_age_hr,
             "AGE_SINCE_LAST_MNT": df["age_since_last_maint"],
             "ARM_DIST_mm": df["arm_dist_mm"],
             "ARM_DIST_DELTA": df["arm_dist_mm_per_hr"],
@@ -830,11 +862,12 @@ def main() -> None:
             "BEARING_TEMP_CUM": df["cumulative_bearing_heat"],
             "TEMP_X_ROPE": df["temp_x_rope"],
             "RUL_HR": df["RUL_hrs"],
+            "MAINTENANCE_DONE": df["maintenance_done"],
         }
     )
 
-    output_path = f"{OUTPUT_FILENAME}.pkl"
-    df_filtered.to_pickle(output_path)
+    output_path = f"{OUTPUT_FILENAME}.csv"
+    df_filtered.to_csv(output_path, index=False)
     print(f"\n  Saved → {output_path}  ({len(df_filtered):,} rows)")
 
 
